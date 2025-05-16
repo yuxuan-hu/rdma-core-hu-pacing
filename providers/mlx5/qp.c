@@ -47,6 +47,36 @@
 
 #define MLX5_ATOMIC_SIZE 8
 
+/*[hyx]*/
+// get cycles for qp
+static inline unsigned long get_cycles(void){
+	uint32_t low, high;
+	uint64_t val;
+	asm volatile("rdtsc" : "=a" (low), "=d" (high));
+	val = high;
+	val = (val << 32) | low;
+	return val;
+}
+
+// init gap
+uint64_t last_wqe_gap = Gmin;  // init wqe gap to Gmin
+uint64_t wqe_gap = Gmin;
+// init wqe count
+uint64_t inflight_wqe_num = 0;
+
+/*[TODO]*/
+// 使用一个很小的共享内存作为后台程序，让多个 perftest 进程之间可以共享网卡中 WQE 队列的信息，也就是共用一个 inflight wqe num，这样做是合理的，这是由于不管有多少个 perftest 进程，实际上只会共用一个网卡资源
+// 如果不同的 perftest 进程使用的是不同的 inflight wqe num，那么只能近似认为是均分网卡资源了
+// 这里设置为 4k 只是对于单进程的测试而言是合理的
+
+/*[TODO]
+[NEED TO FIX]
+1.稳定性已经测试过了，效果很不错，控制效果很好而且比较稳定
+2.latency没办法直接侧，有问题，会死循环（目前只能去改改perftest的ib send lat进行模拟测试）
+3.响应速度也没办法直接测，自己写的perftest测试ib send bw不知道为啥cqe gap测出来一直是0，有问题（目前解决思路是直接修改wqe gap和cqe gap的初始化数值，进行模拟，看看多长时间能够收敛到目标message size相对应的gap的大小，去进行模拟测试）
+	直接改cqe gap即可，因为wqe gap会从0开始，感觉即使改了初始值，wqe gao还是会变为0，改了没有任何的用处了
+*/
+
 static const uint32_t mlx5_ib_opcode[] = {
 	[IBV_WR_SEND]			= MLX5_OPCODE_SEND,
 	[IBV_WR_SEND_WITH_INV]		= MLX5_OPCODE_SEND_INVAL,
@@ -805,6 +835,45 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				  struct ibv_send_wr **bad_wr)
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
+
+	/*[hyx]*/
+	// wqe 数量加一
+	inflight_wqe_num++;
+	// printf("inflight_wqe_num++: %lu\n", inflight_wqe_num);
+	if(inflight_wqe_num < (uint64_t)(MAX_WQE_NUM * Kmin)){
+		// 当 inflight_wqe_num < Kmin * MAX_WQE_NUM 时，允许 post send 操作
+		// printf("qp:inflight_wqe_num < (uint64_t)(MAX_WQE_NUM * Kmin)\n");
+		wqe_gap = Gmin;
+		last_wqe_gap = wqe_gap;
+	}else 
+	// if(inflight_wqe_num < (uint64_t)(MAX_WQE_NUM * Kmax))
+	// 原本理论上 inflight 应该不会超过特别多，但是 perftest 会下发特别多的 wqe ，而且不会立即 poll ，因此，不管 wqe gap 是多大，都需要用队列进行反馈，否则会导致下发过快了 
+	{
+		// printf("qp:(uint64_t)(MAX_WQE_NUM * Kmin) <= inflight_wqe_num < (uint64_t)(MAX_WQE_NUM * Kmax)\n");
+		int64_t cal_wqe_gap = (int64_t)last_wqe_gap + (int64_t)(kn * ((int64_t)(inflight_wqe_num) - (int64_t)(MAX_WQE_NUM)));	
+		// printf("qp:cal_wqe_gap: %ld\n", cal_wqe_gap);
+		if(cal_wqe_gap < 0 || cal_wqe_gap < Gmin){
+			wqe_gap = Gmin;
+		// }else if(cal_wqe_gap > Gtarget_cqe_gap){
+			// wqe_gap = Gtarget_cqe_gap;
+		}else{
+			wqe_gap = (uint64_t)cal_wqe_gap;
+		}
+		// 在这里不希望随着 wqe 的 post send ，wqe gap 产生过大的增量和便宜，这是由于 perftest 一次会下发大量的 wqe ，因此，只需要保证 wqe gap 在 last wqe gap 附近变化即可，如果更新 last 的话，可能会导致 wqe gap 不断叠加，发生非常大的变化的
+		// last_wqe_gap = wqe_gap;
+	}
+	// else{
+	// 	printf("qp:inflight_wqe_num >= (uint64_t)(MAX_WQE_NUM * Kmax)\n");
+	// 	if(Gtarget_cqe_gap != 0){
+	// 		wqe_gap = Gtarget_cqe_gap;
+	// 		last_wqe_gap = wqe_gap;
+	// 	}
+	// }
+	printf("qp:wqe_gap: %lu\n", wqe_gap);
+
+	// update 记录 post send 操作的开始时间
+	qp->last_post_send_cycle = get_cycles();
+
 	void *seg;
 	struct mlx5_wqe_eth_seg *eseg;
 	struct mlx5_wqe_ctrl_seg *ctrl = NULL;
@@ -861,14 +930,26 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			fence = next_fence;
 		next_fence = 0;
 		idx = qp->sq.cur_post & (qp->sq.wqe_cnt - 1);
+		/*[hyx]*/
+		// 记录 send signaled 的情况
+		qp->sq.is_send_signaled[idx] = (wr->send_flags & IBV_SEND_SIGNALED) ? 1 : 0;
+
 		ctrl = seg = mlx5_get_send_wqe(qp, idx);
 		*(uint32_t *)(seg + 8) = 0;
 		ctrl->imm = send_ieth(wr);
+
+		/*[hyx]*/
+		// IBV_SEND_SIGNALED -> MLX5_WQE_CTRL_CQ_UPDATE
 		ctrl->fm_ce_se = qp->sq_signal_bits | fence |
 			(wr->send_flags & IBV_SEND_SIGNALED ?
-			 MLX5_WQE_CTRL_CQ_UPDATE : 0) |
+			 MLX5_WQE_CTRL_CQ_UPDATE : MLX5_WQE_CTRL_CQ_UPDATE) |
 			(wr->send_flags & IBV_SEND_SOLICITED ?
 			 MLX5_WQE_CTRL_SOLICITED : 0);
+		// ctrl->fm_ce_se = qp->sq_signal_bits | fence |
+			// (wr->send_flags & IBV_SEND_SIGNALED ?
+			//  MLX5_WQE_CTRL_CQ_UPDATE : 0) |
+			// (wr->send_flags & IBV_SEND_SOLICITED ?
+			//  MLX5_WQE_CTRL_SOLICITED : 0);
 
 		seg += sizeof *ctrl;
 		size = sizeof *ctrl / 16;
@@ -1155,6 +1236,21 @@ out:
 	return err;
 }
 
+/*[hyx]*/
+// calculate gap cycles
+static inline uint64_t cal_wqe_gap_cycles(struct ibv_qp *ibqp, struct ibv_send_wr *wr){
+	struct mlx5_qp *mqp = to_mqp(ibqp);
+	uint64_t wqe_gap_cycles = (uint64_t)(mqp->cpu_mhz * wqe_gap / 1000);
+	uint64_t gap_deadline = mqp->last_post_send_cycle + wqe_gap_cycles;
+	// printf("cpu_mhz: %f\n", mqp->cpu_mhz);
+	// printf("wqe_gap: %lu\n", wqe_gap);
+	// printf("wqe_gap_cycles: %lu\n", wqe_gap_cycles);
+	// printf("last_post_send_cycle: %lu\n", mqp->last_post_send_cycle);
+	// printf("post_send_gap: %lu\n", get_cycles() - mqp->last_post_send_cycle);
+	// printf("gap_deadline: %lu\n", gap_deadline);
+	return gap_deadline;
+}
+
 int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		   struct ibv_send_wr **bad_wr)
 {
@@ -1172,6 +1268,13 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			return EINVAL;
 	}
 #endif
+
+	/*[hyx]*/
+	// post send until deadline
+	uint64_t gap_ddl = cal_wqe_gap_cycles(ibqp, wr);
+	while(get_cycles() < gap_ddl){
+		asm("nop");
+	}
 
 	return _mlx5_post_send(ibqp, wr, bad_wr);
 }

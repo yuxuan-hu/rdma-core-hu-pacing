@@ -51,6 +51,10 @@
 #include <ccan/minmax.h>
 #include "mlx5dv.h"
 
+/*[hyx]*/
+#include <sys/time.h>
+
+
 #include <valgrind/memcheck.h>
 
 #define PFX		"mlx5: "
@@ -58,6 +62,28 @@
 #ifndef PCI_VENDOR_ID_MELLANOX
 #define PCI_VENDOR_ID_MELLANOX 0x15b3
 #endif
+
+/*[hyx]*/
+// 定义 Valve 相关的参数
+#define MAX_WQE_NUM 4096  // target WQE number
+#define Kmin 0.9
+#define Kmax 1.1
+#define Gmin 10  // ns
+#define Gmax 2000  // ns
+#define Ke 0.1
+// 原本设置的数值是 0.1 ，但是 perftest 打流的时候会首先一次性下发特别多的 wqe ，然后才会 poll cq ，因此这个参数应该设置的更小，防止出现 wqe gap 的突变
+#define kn 0.1
+// 定义 EWMA 相关的参数，取值范围为 0 到 1，此处取值为 0.1 ，这是由于尽可能考虑平滑性，避免突发性的波动
+// 0.1 表示 EWMA 的权重为 0.9，即当前值的 90% 由历史值决定，10% 由当前值决定
+#define EWMA 0.1
+
+extern uint64_t last_wqe_gap;
+extern uint64_t wqe_gap;
+extern uint64_t last_cqe_gap;
+extern uint64_t cqe_gap;
+extern uint64_t inflight_wqe_num;
+
+extern uint64_t Gtarget_cqe_gap;
 
 typedef _Atomic(uint32_t) atomic_uint32_t;
 
@@ -606,6 +632,8 @@ struct mlx5_wq {
 	int				offset;
 	void			       *qend;
 	uint32_t			*wr_data;
+	/*[hyx]*/
+	uint8_t *is_send_signaled;
 };
 
 struct mlx5_devx_uar {
@@ -722,7 +750,13 @@ struct mlx5_qp {
 	uint32_t			get_ece;
 
 	uint8_t				need_mmo_enable:1;
+
+	/*[hyx]*/
+	double cpu_mhz;
+	uint64_t last_post_send_cycle;
 };
+
+double get_cpu_mhz(int no_cpu_freq_warn);
 
 struct mlx5_ah {
 	struct ibv_ah			ibv_ah;

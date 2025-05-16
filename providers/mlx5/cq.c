@@ -46,6 +46,21 @@
 #include "mlx5.h"
 #include "wqe.h"
 
+/*[hyx]*/
+// init gap
+uint64_t last_cqe_gap = 0;
+uint64_t cqe_gap = 0;
+
+// for cqe gap(no need for global variable)
+uint64_t last_poll_cqe_timestamp = 0;
+uint64_t this_poll_cqe_timestamp = 0;
+
+// 根据前 2048 个数据计算 cqe 间隔的平均值
+const uint64_t MAX_ANALYSIS_CQE_GAP = 2048;
+uint64_t Gtarget_cqe_gap = 0;
+uint64_t cqe_gap_sum = 0;
+uint64_t cqe_gap_count = 0;
+
 enum {
 	CQ_OK					=  0,
 	CQ_EMPTY				= -1,
@@ -757,6 +772,106 @@ again:
 			return CQ_POLL_ERR;
 		wq = &mqp->sq;
 		idx = wqe_ctr & (wq->wqe_cnt - 1);
+
+		/*[hyx]*/
+		// printf("function mlx5_parse_cq->MLX5_CQE_REQ\n");
+		// printf("qp number: %u\n", qpn);
+		// printf("wqe_ctr: %u\n", wqe_ctr);
+		// printf("wqe idx: %u\n", idx);
+		// printf("wq->wrid[idx]: %lu\n", wq->wrid[idx]);
+		// printf("wq->wqe_head[idx]: %u\n", wq->wqe_head[idx]);
+		// poll cqe -> hardware timestamp
+		uint64_t poll_cqe_timestamp = mlx5dv_ts_to_ns(&cq->last_clock_info, be64toh(cqe64->timestamp));
+		if(last_poll_cqe_timestamp == 0){
+			last_poll_cqe_timestamp = poll_cqe_timestamp;
+		}
+		this_poll_cqe_timestamp = poll_cqe_timestamp;
+		if(last_cqe_gap == 0){
+			last_cqe_gap = this_poll_cqe_timestamp - last_poll_cqe_timestamp;	
+		}
+		// 这里存在一个问题，会发生一些偶然的情况导致 poll cqe timestamp 的时间间隔非常大，甚至于要比正常的数值大两个数量级，这一定会导致计算出现偏差，因此需要处理这种情况
+		if(((this_poll_cqe_timestamp - last_poll_cqe_timestamp) > 10 * last_cqe_gap) && (last_cqe_gap != 0)){
+			// 这是一种折中的处理，主要的目的是为了让 poll cqe 的 timestamp 不要发生剧变，当然由于实际上这个时间间隔还是较大的，因此是乘以 2 ，而不是直接减去一个 gap ，也不是 10 ，否则太大了
+			printf("poll cqe timestamp gap error\n");
+			last_poll_cqe_timestamp = this_poll_cqe_timestamp - 2 * last_cqe_gap;
+			// 从实测效果来看，采用这种方式可以剔除异常值，并且对于实际的 gap 计算不会造成过大的误差，从而也使得 wqe gap 的计算较为准确和平滑，不会发生突变
+		}
+		// EWMA algorithm
+		cqe_gap = (uint64_t)(EWMA*(this_poll_cqe_timestamp - last_poll_cqe_timestamp)) + (uint64_t)((1-EWMA)*last_cqe_gap);
+		// 计算 target cqe gap
+		if(Gtarget_cqe_gap == 0){
+			if(cqe_gap_count <= MAX_ANALYSIS_CQE_GAP){
+				cqe_gap_sum += cqe_gap;
+				cqe_gap_count++;
+			}else{
+				Gtarget_cqe_gap = (uint64_t)(cqe_gap_sum / cqe_gap_count);
+				printf("Gtarget_cqe_gap: %lu\n", Gtarget_cqe_gap);
+			}
+		}else{
+			// 规范 cqe gap 的大小，如果 cqe gap 过大，应该回归至 Gtarget cqe gap 的大小附近，负责会进一步导致 wqe gap 漂移，反馈之后 cqe gap 进一步增大，导致恶性循环
+			if(cqe_gap > 2 * Gtarget_cqe_gap){
+				cqe_gap = Gtarget_cqe_gap;	
+			}
+		}
+		
+		// update last_poll_cqe_timestamp
+		last_poll_cqe_timestamp = this_poll_cqe_timestamp;
+		// update last_cqe_gap
+		last_cqe_gap = cqe_gap;
+		printf("cqe_gap: %lu\n", cqe_gap);
+		// std::cout<<"poll cqe timestamp: "<<poll_cqe_timestamp<<std::endl;
+		// printf("poll cqe timestamp: %lu\n", poll_cqe_timestamp);
+
+		// wqe 数量减一
+		inflight_wqe_num--;
+		// printf("inflight_wqe_num--: %lu\n", inflight_wqe_num);
+
+		// 更新 wqe gap
+		/*
+		1. quick start -> Gmin
+		2. stable state -> Adaptive AIAD
+			2.1 Ke -> wqe gap - cqe gap
+			2.2 Kn -> inflight wqe - max wqe
+		3. slow pace -> Gmax or factor * cqe_gap
+		*/
+		// printf("last_wqe_gap: %lu\n", last_wqe_gap);
+		if(inflight_wqe_num < (uint64_t)(MAX_WQE_NUM * Kmin)){
+			// printf("inflight_wqe_num < (uint64_t)(MAX_WQE_NUM * Kmin)\n");
+			wqe_gap = Gmin;
+			last_wqe_gap = wqe_gap;
+		}else if(inflight_wqe_num < (uint64_t)(MAX_WQE_NUM * Kmax)){
+			// printf("(uint64_t)(MAX_WQE_NUM * Kmin) <= inflight_wqe_num < (uint64_t)(MAX_WQE_NUM * Kmax)\n");
+			// int64_t cal_wqe_gap = (int64_t)last_wqe_gap - (int64_t)(Ke * ((int64_t)(last_wqe_gap) - (int64_t)(cqe_gap))) + (int64_t)(kn * ((int64_t)(inflight_wqe_num) - (int64_t)(MAX_WQE_NUM)));
+			// 将 Kn 的部分放在 post send 的时候进行反馈和更新 可以让粒度更细一些
+			/*[TODO]*/
+			// 原则上来讲，每次 inflight wqe num 发生变化都应该更新 wqe gap ，但是 perftest 打流时如果在 poll cq 更新一下 wqe gap ，会导致较大的波动
+			int64_t cal_wqe_gap = (int64_t)last_wqe_gap - (int64_t)(Ke * ((int64_t)(last_wqe_gap) - (int64_t)(cqe_gap)));
+			// printf("cal_wqe_gap: %ld\n", cal_wqe_gap);
+			if(cal_wqe_gap < 0 || cal_wqe_gap < Gmin){
+				wqe_gap = Gmin;
+			// }else if(cal_wqe_gap > Gtarget_cqe_gap){
+				// wqe_gap = Gtarget_cqe_gap;
+			}else{
+				wqe_gap = (uint64_t)cal_wqe_gap;
+			}
+			last_wqe_gap = wqe_gap;
+		}else{
+			// printf("inflight_wqe_num >= (uint64_t)(MAX_WQE_NUM * Kmax)\n");
+			// wqe_gap = Gmax;
+			// Gmax 是一个固定值，感觉还是自适应的数值合适一些
+			if(Gtarget_cqe_gap != 0){
+				wqe_gap = Gtarget_cqe_gap;
+				last_wqe_gap = wqe_gap;
+			}
+		}
+		printf("wqe_gap: %lu\n", wqe_gap);
+
+		// 如果 send signaled 的标志是 0 ，表示是额外产生的 CQE ，需要直接返回，不进行后续的处理
+		if(!mqp->sq.is_send_signaled[idx]){
+			// printf("mqp->sq.is_send_signaled[idx] is 0, return CQ_EMPTY\n");
+			return CQ_EMPTY;
+		}
+		
 		if (lazy) {
 			uint32_t wc_byte_len;
 

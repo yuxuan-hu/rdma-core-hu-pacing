@@ -59,6 +59,189 @@
 #include "wqe.h"
 #include "mlx5_ifc.h"
 
+/*[hyx]*/
+// 添加 mlx5dv 调用硬件时间戳记录 CQE 提交的具体时间
+#include "mlx5dv.h"
+
+#if defined(__x86_64__) || defined (__i386__)
+typedef unsigned long long cycles_t;
+static inline unsigned long get_cycles(void)
+{
+	uint32_t low, high;
+	uint64_t val;
+	asm volatile ("rdtsc" : "=a" (low), "=d" (high));
+	val = high;
+	val = (val << 32) | low;
+	return val;
+}
+#endif
+
+// 添加获取 cpu mhz 频率的函数
+
+#ifndef DEBUG
+#define DEBUG 0
+#endif
+#ifndef DEBUG_DATA
+#define DEBUG_DATA 0
+#endif
+
+#define MEASUREMENTS 200
+#define USECSTEP 10
+#define USECSTART 100
+
+/*
+   Use linear regression to calculate cycles per microsecond.
+http://en.wikipedia.org/wiki/Linear_regression#Parameter_estimation
+*/
+static double sample_get_cpu_mhz(void)
+{
+	struct timeval tv1, tv2;
+	cycles_t start;
+	double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+	double tx, ty;
+	int i;
+
+	/* Regression: y = a + b x */
+	long x[MEASUREMENTS];
+	cycles_t y[MEASUREMENTS];
+	double a; /* system call overhead in cycles */
+	double b; /* cycles per microsecond */
+	double r_2;
+
+	for (i = 0; i < MEASUREMENTS; ++i) {
+		start = get_cycles();
+
+		if (gettimeofday(&tv1, NULL)) {
+			fprintf(stderr, "gettimeofday failed.\n");
+			return 0;
+		}
+
+		do {
+			if (gettimeofday(&tv2, NULL)) {
+				fprintf(stderr, "gettimeofday failed.\n");
+				return 0;
+			}
+		} while ((tv2.tv_sec - tv1.tv_sec) * 1000000 +
+				(tv2.tv_usec - tv1.tv_usec) < USECSTART + i * USECSTEP);
+
+		x[i] = (tv2.tv_sec - tv1.tv_sec) * 1000000 +
+			tv2.tv_usec - tv1.tv_usec;
+		y[i] = get_cycles() - start;
+		if (DEBUG_DATA)
+			fprintf(stderr, "x=%ld y=%Ld\n", x[i], (long long)y[i]);
+	}
+
+	for (i = 0; i < MEASUREMENTS; ++i) {
+		tx = x[i];
+		ty = y[i];
+		sx += tx;
+		sy += ty;
+		sxx += tx * tx;
+		syy += ty * ty;
+		sxy += tx * ty;
+	}
+
+	b = (MEASUREMENTS * sxy - sx * sy) / (MEASUREMENTS * sxx - sx * sx);
+	a = (sy - b * sx) / MEASUREMENTS;
+
+	if (DEBUG)
+		fprintf(stderr, "a = %g\n", a);
+	if (DEBUG)
+		fprintf(stderr, "b = %g\n", b);
+	if (DEBUG)
+		fprintf(stderr, "a / b = %g\n", a / b);
+	r_2 = (MEASUREMENTS * sxy - sx * sy) * (MEASUREMENTS * sxy - sx * sy) /
+		(MEASUREMENTS * sxx - sx * sx) /
+		(MEASUREMENTS * syy - sy * sy);
+
+	if (DEBUG)
+		fprintf(stderr, "r^2 = %g\n", r_2);
+	if (r_2 < 0.9) {
+		fprintf(stderr,"Correlation coefficient r^2: %g < 0.9\n", r_2);
+		return 0;
+	}
+
+	return b;
+}
+
+#if !defined(__s390x__) && !defined(__s390__)
+static double proc_get_cpu_mhz(int no_cpu_freq_warn)
+{
+	FILE* f;
+	char buf[256];
+	double mhz = 0.0;
+	int print_flag = 0;
+	double delta;
+
+	#if defined(__FreeBSD__)
+	f = popen("/sbin/sysctl hw.clockrate","r");
+	#else
+	f = fopen("/proc/cpuinfo","r");
+	#endif
+
+	if (!f)
+		return 0.0;
+	while(fgets(buf, sizeof(buf), f)) {
+		double m;
+		int rc;
+
+		#if defined (__ia64__)
+		/* Use the ITC frequency on IA64 */
+		rc = sscanf(buf, "itc MHz : %lf", &m);
+		#elif defined (__PPC__) || defined (__PPC64__)
+		/* PPC has a different format as well */
+		rc = sscanf(buf, "clock : %lf", &m);
+		#elif defined (__sparc__) && defined (__arch64__)
+		/*
+		 * on sparc the /proc/cpuinfo lines that hold
+		 * the cpu freq in HZ are as follow:
+		 * Cpu{cpu-num}ClkTck      : 00000000a9beeee4
+		 */
+		char *s;
+
+		s = strstr(buf, "ClkTck\t: ");
+		if (!s)
+			continue;
+		s += (strlen("ClkTck\t: ") - strlen("0x"));
+		strncpy(s, "0x", strlen("0x"));
+		rc = sscanf(s, "%lf", &m);
+		m /= 1000000;
+		#else
+		#if defined (__FreeBSD__)
+		rc = sscanf(buf, "hw.clockrate: %lf", &m);
+		#else
+		rc = sscanf(buf, "cpu MHz : %lf", &m);
+		#endif
+		#endif
+
+		if (rc != 1)
+			continue;
+
+		if (mhz == 0.0) {
+			mhz = m;
+			continue;
+		}
+		delta = mhz > m ? mhz - m : m - mhz;
+		if ((delta / mhz > 0.02) && (print_flag ==0)) {
+			print_flag = 1;
+			if (!no_cpu_freq_warn) {
+				fprintf(stderr, "Conflicting CPU frequency values"
+						" detected: %lf != %lf. CPU Frequency is not max.\n", mhz, m);
+			}
+			continue;
+		}
+	}
+
+#if defined(__FreeBSD__)
+	pclose(f);
+#else
+	fclose(f);
+#endif
+	return mhz;
+}
+#endif
+
+
 int mlx5_single_threaded = 0;
 
 static inline int is_xrc_tgt(int type)
@@ -1182,9 +1365,16 @@ struct ibv_cq *mlx5_create_cq(struct ibv_context *context, int cqe,
 			      int comp_vector)
 {
 	struct ibv_cq_ex *cq;
+	// struct ibv_cq_init_attr_ex cq_attr = {.cqe = cqe, .channel = channel,
+						// .comp_vector = comp_vector,
+						// .wc_flags = IBV_WC_STANDARD_FLAGS};
+
+	/*[hyx]*/
+	// 使能硬件时间戳
+	// IBV_CREATE_CQ_SUP_WC_FLAGS
 	struct ibv_cq_init_attr_ex cq_attr = {.cqe = cqe, .channel = channel,
 						.comp_vector = comp_vector,
-						.wc_flags = IBV_WC_STANDARD_FLAGS};
+						.wc_flags = IBV_CREATE_CQ_SUP_WC_FLAGS};
 
 	if (cqe <= 0) {
 		errno = EINVAL;
@@ -1192,6 +1382,18 @@ struct ibv_cq *mlx5_create_cq(struct ibv_context *context, int cqe,
 	}
 
 	cq = create_cq(context, &cq_attr, 0, NULL);
+
+	// 初始化硬件时钟，ns 级别的时间戳
+	struct mlx5_cq *mcq = to_mcq(ibv_cq_ex_to_cq(cq));
+	int time_err = mlx5dv_get_clock_info(ibv_cq_ex_to_cq(cq)->context, &mcq->last_clock_info);
+	if(time_err != 0){
+		// std::cout<<"Get Clock Info ERROR"<<std::endl;
+		printf("Get Clock Info ERROR\n");
+	}else{
+		// std::cout<<"Get Clock Info OK"<<std::endl;
+		printf("Get Clock Info OK\n");
+	}
+
 	return cq ? ibv_cq_ex_to_cq(cq) : NULL;
 }
 
@@ -1961,6 +2163,15 @@ static int mlx5_alloc_qp_buf(struct ibv_context *context,
 			err = -1;
 			goto ex_wrid;
 		}
+
+		/*[hyx]*/
+		// 分配 send signaled 标志位的内存
+		qp->sq.is_send_signaled = malloc(qp->sq.wqe_cnt * sizeof(*qp->sq.is_send_signaled));
+		if(!qp->sq.is_send_signaled){
+			errno = ENOMEM;
+			err = -1;
+			return err;
+		}
 	}
 
 	if (qp->rq.wqe_cnt) {
@@ -2044,6 +2255,12 @@ ex_wrid:
 	if (qp->sq.wrid)
 		free(qp->sq.wrid);
 
+	/*[hyx]*/
+	// 如果发生错误的话，需要把已经分配的空间释放掉
+	if(qp->sq.is_send_signaled){
+		free(qp->sq.is_send_signaled);
+	}
+	
 	return err;
 }
 
@@ -2065,6 +2282,12 @@ static void mlx5_free_qp_buf(struct mlx5_context *ctx, struct mlx5_qp *qp)
 
 	if (qp->sq.wr_data)
 		free(qp->sq.wr_data);
+
+	/*[hyx]*/
+	// 释放 send signaled 标志位的内存
+	if(qp->sq.is_send_signaled){
+		free(qp->sq.is_send_signaled);
+	}
 }
 
 int mlx5_set_ece(struct ibv_qp *qp, struct ibv_ece *ece)
@@ -2786,6 +3009,35 @@ err:
 	return NULL;
 }
 
+/*[hyx]*/
+// get cpu mhz
+double get_cpu_mhz(int no_cpu_freq_warn){
+	#if defined(__s390x__) || defined(__s390__)
+		return sample_get_cpu_mhz();
+	#else
+		double sample, proc, delta;
+		sample = sample_get_cpu_mhz();
+		proc = proc_get_cpu_mhz(no_cpu_freq_warn);
+		#ifdef __aarch64__
+			if (proc < 1)
+				proc = sample;
+		#endif
+		#ifdef __riscv
+			if (proc <= 0)
+				proc = sample;
+		#endif
+
+		if (!proc || !sample)
+			return 0;
+
+		delta = proc > sample ? proc - sample : sample - proc;
+		if (delta / proc > 0.02) {
+			return sample;
+		}
+		return proc;
+	#endif
+}
+
 struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
 			      struct ibv_qp_init_attr *attr)
 {
@@ -2799,6 +3051,13 @@ struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
 	qp = create_qp(pd->context, &attrx, NULL);
 	if (qp)
 		memcpy(attr, &attrx, sizeof(*attr));
+
+	/*[hyx]*/
+	// 由于获取 cpu 频率的开销比较大，仅在初始化的时候获取一次 cpu 的频率
+	// qp -> mqp
+	struct mlx5_qp *mqp = to_mqp(qp);
+	mqp->cpu_mhz = get_cpu_mhz(0);
+	mqp->last_post_send_cycle = get_cycles();
 
 	return qp;
 }
