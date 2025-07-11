@@ -3058,6 +3058,8 @@ struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
 	struct mlx5_qp *mqp = to_mqp(qp);
 	mqp->cpu_mhz = get_cpu_mhz(0);
 	mqp->last_post_send_cycle = get_cycles();
+	// symphony
+	mqp->last_post_recv_cycle = get_cycles();
 
 	return qp;
 }

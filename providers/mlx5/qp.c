@@ -3856,6 +3856,7 @@ static void set_wq_sig_seg(struct mlx5_rwq *rwq, struct mlx5_rwqe_sig *sig,
 int mlx5_post_wq_recv(struct ibv_wq *ibwq, struct ibv_recv_wr *wr,
 		      struct ibv_recv_wr **bad_wr)
 {
+	printf("mlx5_post_wq_recv\n");
 	struct mlx5_rwq *rwq = to_mrwq(ibwq);
 	struct mlx5_wqe_data_seg *scat;
 	int err = 0;
@@ -3926,10 +3927,54 @@ out:
 	return err;
 }
 
+// symphony
+static inline uint64_t cal_receive_wqe_gap_cycles(struct ibv_qp *ibqp, struct ibv_recv_wr *wr){
+	// for receive wqe gap rwqe 
+	struct mlx5_qp *mqp = to_mqp(ibqp);
+	uint64_t wqe_gap_cycles = (uint64_t)(mqp->cpu_mhz * wqe_gap / 1000);
+	// recv wqe gap
+	uint64_t gap_deadline = mqp->last_post_recv_cycle + wqe_gap_cycles;
+	printf("rwqe gap_deadline = %lu\n", gap_deadline);
+	return gap_deadline;
+}
+
 int mlx5_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 		   struct ibv_recv_wr **bad_wr)
 {
+	// 由于post_recv会默认生成cqe，因此不需要额外指定标志位或者说进行cqe的聚合或者过滤等其他操作。
+	printf("mlx5_post_recv\n");
+	// symphony
+	uint64_t gap_deadline = cal_receive_wqe_gap_cycles(ibqp, wr);
+	while(get_cycles() < gap_deadline){
+		// 不执行指令
+		asm("nop");
+	}
+	inflight_wqe_num++;
+	// 这里需要和发送端做一个适配，因此需要根据inflight wqe数量做一个判断进行区分不同的情况的
+	if(inflight_wqe_num < (uint64_t)(MAX_WQE_NUM * Kmin)){
+		wqe_gap = Gmin;
+		last_wqe_gap = wqe_gap;
+	}else{
+		// printf("qp:(uint64_t)(MAX_WQE_NUM * Kmin) <= inflight_wqe_num < (uint64_t)(MAX_WQE_NUM * Kmax)\n");
+		int64_t cal_wqe_gap = (int64_t)last_wqe_gap + (int64_t)(kn * ((int64_t)(inflight_wqe_num) - (int64_t)(MAX_WQE_NUM)));	
+		// printf("qp:cal_wqe_gap: %ld\n", cal_wqe_gap);
+		if(cal_wqe_gap < 0 || cal_wqe_gap < Gmin){
+			wqe_gap = Gmin;
+		}else{
+			wqe_gap = (uint64_t)cal_wqe_gap;
+		}
+	}
+	// // symphony1
+	// uint64_t gap_deadline = cal_receive_wqe_gap_cycles(ibqp, wr);
+	// while(get_cycles() < gap_deadline){
+	// 	asm("nop");
+	// }
 	struct mlx5_qp *qp = to_mqp(ibqp);
+
+	// symphony
+	// 更新 recv cycle 便于进行下一次的计算 
+	qp->last_post_recv_cycle = get_cycles();
+
 	struct mlx5_wqe_data_seg *scat;
 	int err = 0;
 	int nreq;

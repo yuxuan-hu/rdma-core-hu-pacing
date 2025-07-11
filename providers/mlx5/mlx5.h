@@ -754,6 +754,8 @@ struct mlx5_qp {
 	/*[hyx]*/
 	double cpu_mhz;
 	uint64_t last_post_send_cycle;
+	// symphony
+	uint64_t last_post_recv_cycle;
 };
 
 double get_cpu_mhz(int no_cpu_freq_warn);
